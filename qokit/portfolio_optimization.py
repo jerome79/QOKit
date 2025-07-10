@@ -9,6 +9,7 @@ from functools import partial
 import itertools
 from typing import Any
 from qokit.parameter_utils import get_sk_gamma_beta
+from numba import njit
 
 from typing import Tuple, Optional, List, cast
 
@@ -35,6 +36,32 @@ def get_configuration_cost(po_problem, config):
 
     return po_problem["q"] * config.dot(cov).dot(config) - means.dot(config)
 
+def get_configuration_cost_vector(po_problem, config):
+    """
+    Compute energy for single sample configuration or batch of configurations
+    f(x) = q \sigma_ij x_i x_j - \mu_i x_i
+    Vectorized for 2D config input.
+    """
+    scale = po_problem["scale"]
+    means = po_problem["means"] / scale
+    cov = po_problem["cov"] / scale
+    q = po_problem["q"]
+
+    config = np.asarray(config)
+    if config.ndim == 1:
+        # Single bitstring
+        return q * config.dot(cov).dot(config) - means.dot(config)
+    elif config.ndim == 2:
+        # Batch of bitstrings
+        # config: (batch, N), cov: (N, N), means: (N,)
+        # quadratic term: (config @ cov) * config, sum over axis=1
+        quad = np.einsum('ij,jk,ik->i', config, cov, config)
+        linear = config.dot(means)
+        return q * quad - linear
+    else:
+        raise ValueError("config must be 1D or 2D array")
+
+
 
 def get_configuration_cost_kw(config, po_problem=None):
     """
@@ -43,12 +70,27 @@ def get_configuration_cost_kw(config, po_problem=None):
     """
     return get_configuration_cost(po_problem, config)
 
+def get_configuration_cost_kw_vector(config, po_problem=None):
+    """
+    Convenience function for functools.partial
+    e.g. po_obj = partial(get_configuration_cost, po_problem=po_problem)
+    Now supports vectorized (batch) config.
+    """
+    return get_configuration_cost_vector(po_problem, config)
+
 
 def po_obj_func(po_problem: dict) -> float:
     """
     Wrapper function for compute a portofolio value
     """
     return partial(get_configuration_cost_kw, po_problem=po_problem)
+
+def po_obj_func_vector(po_problem: dict) -> float:
+    """
+    Wrapper function for compute a portofolio value
+    Now supports vectorized (batch) config.
+    """
+    return partial(get_configuration_cost_kw_vector, po_problem=po_problem)
 
 
 def kbits(N, K):
@@ -165,6 +207,31 @@ def get_problem(N, K, q, seed=1, pre=False) -> dict[str, Any]:
 
     return po_problem
 
+def get_problem_vectorized(N, K, q, seed=1, pre=False) -> dict[str, Any]:
+    """generate the portofolio optimziation problem dict"""
+    po_problem = {}
+    po_problem["N"] = N
+    po_problem["K"] = K
+    po_problem["q"] = q
+    po_problem["seed"] = seed
+    po_problem["means"], po_problem["cov"] = get_data(N, seed=seed)
+    po_problem["pre"] = pre
+    if pre == "rule":
+        means_in_spins = po_problem["means"] - q * np.sum(po_problem["cov"], axis=1)
+        scale = 1 / np.sqrt(
+            np.mean((q * po_problem["cov"]) ** 2) + np.mean(means_in_spins ** 2)
+        )
+    elif np.isscalar(pre):
+        scale = pre
+    else:
+        scale = 1
+
+    po_problem["scale"] = scale
+    po_problem["means"] = scale * po_problem["means"]
+    po_problem["cov"] = scale * po_problem["cov"]
+
+    return po_problem
+
 
 def get_problem_H(po_problem):
     """
@@ -245,18 +312,22 @@ def get_problem_H_bf(po_problem):
     return H_all2
 
 
-def hamming_weight(index: str) -> int:
+@njit(cache=True, fastmath=True)
+def hamming_weight(index: int) -> int:
     """
-    Calculate the hamming weight for a given bitstring
-    e.g. 107 == 1101011 --> 5
+    Calculate the hamming weight for a given integer using bitwise operations.
     """
-    binary = bin(index)[2:]
-    return binary.count("1")
+    count = 0
+    while index:
+        count += index & 1
+        index >>= 1
+    return count
 
 
+@njit(cache=True)
 def yield_all_indices_cosntrained(N: int, K: int):
     """
-    Helper function to avoid having to store all indices in memory
+    Numba-accelerated generator for indices with Hamming weight K.
     """
     for ind in range(2**N):
         if hamming_weight(ind) == K:
